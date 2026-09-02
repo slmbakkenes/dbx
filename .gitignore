@@ -1,0 +1,15 @@
+/target
+
+# macOS
+.DS_Store
+
+# editors
+*.swp
+*.swo
+.idea/
+.vscode/
+*~
+
+# local scratch
+/*.tmp
+config.toml.tmp
