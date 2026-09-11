@@ -1,4 +1,4 @@
-//! The sidebar tree: project → connection → schema → table.
+//! The sidebar tree: project → connection → database → schema → table.
 
 use crate::config::{Config, Engine};
 use crate::db::ConnId;
@@ -7,6 +7,7 @@ use crate::db::ConnId;
 pub enum NodeKind {
     Project,
     Connection,
+    Database,
     Schema,
     Table,
 }
@@ -218,11 +219,12 @@ impl Tree {
         });
     }
 
-    /// Finds the path to the connection node for `id`.
+    /// Finds the path to the connection node for `id`. A database opened on
+    /// the side is not a configured connection, so it has none.
     pub fn connection_path(&self, id: ConnId) -> Option<Vec<usize>> {
         for (pi, p) in self.roots.iter().enumerate() {
             for (ci, c) in p.children.iter().enumerate() {
-                if c.conn == Some(id) {
+                if c.kind == NodeKind::Connection && c.conn == Some(id) {
                     return Some(vec![pi, ci]);
                 }
             }
@@ -235,8 +237,84 @@ impl Tree {
         self.node_mut(&path)
     }
 
-    pub fn set_schemas(&mut self, id: ConnId, schemas: Vec<String>) {
+    /// Every connection and database node that speaks through `id`. A
+    /// connection and its configured database share one id, so this can
+    /// return both.
+    fn owner_paths(&self, id: ConnId) -> Vec<Vec<usize>> {
+        let mut out = Vec::new();
+        for (pi, p) in self.roots.iter().enumerate() {
+            for (ci, c) in p.children.iter().enumerate() {
+                if c.conn == Some(id) {
+                    out.push(vec![pi, ci]);
+                }
+                for (di, d) in c.children.iter().enumerate() {
+                    if d.kind == NodeKind::Database && d.conn == Some(id) {
+                        out.push(vec![pi, ci, di]);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The node schemas belong under: the database node when there is one,
+    /// the connection itself before its databases are listed.
+    fn owner_path(&self, id: ConnId) -> Option<Vec<usize>> {
+        self.owner_paths(id).into_iter().max_by_key(Vec::len)
+    }
+
+    fn owner_mut(&mut self, id: ConnId) -> Option<&mut Node> {
+        let path = self.owner_path(id)?;
+        self.node_mut(&path)
+    }
+
+    /// Replaces a connection's databases, keeping the schemas already loaded
+    /// under the ones that survive.
+    pub fn set_databases(&mut self, id: ConnId, databases: Vec<(String, ConnId)>) {
         if let Some(node) = self.connection_mut(id) {
+            let existing: Vec<Node> = std::mem::take(&mut node.children);
+            node.children = databases
+                .into_iter()
+                .map(|(name, conn)| {
+                    if let Some(old) = existing.iter().find(|c| c.name == name) {
+                        return old.clone();
+                    }
+                    let mut n = Node::new(NodeKind::Database, &name);
+                    n.conn = Some(conn);
+                    n
+                })
+                .collect();
+            node.loading = false;
+            node.loaded = true;
+            node.expanded = true;
+            node.state = ConnState::Connected;
+        }
+    }
+
+    /// True when schemas have been loaded for a connection or one of its
+    /// databases.
+    pub fn is_loaded(&self, id: ConnId) -> bool {
+        self.owner_path(id)
+            .and_then(|p| self.node(&p))
+            .is_some_and(|n| n.loaded)
+    }
+
+    /// Database names already listed under a connection.
+    pub fn databases(&self, id: ConnId) -> Vec<String> {
+        self.connection_path(id)
+            .and_then(|p| self.node(&p))
+            .map(|n| {
+                n.children
+                    .iter()
+                    .filter(|c| c.kind == NodeKind::Database)
+                    .map(|c| c.name.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn set_schemas(&mut self, id: ConnId, schemas: Vec<String>) {
+        if let Some(node) = self.owner_mut(id) {
             let existing: Vec<Node> = std::mem::take(&mut node.children);
             node.children = schemas
                 .into_iter()
@@ -260,7 +338,7 @@ impl Tree {
     }
 
     pub fn set_tables(&mut self, id: ConnId, schema: &str, tables: Vec<String>) {
-        if let Some(node) = self.connection_mut(id)
+        if let Some(node) = self.owner_mut(id)
             && let Some(sn) = node.children.iter_mut().find(|c| c.name == schema)
         {
             sn.children = tables
@@ -279,6 +357,26 @@ impl Tree {
     }
 
     // --- structural edits driven by the connection form ---
+
+    /// Schemas and `(schema, table)` pairs already loaded for a connection.
+    pub fn identifiers(&self, id: ConnId) -> (Vec<String>, Vec<(String, String)>) {
+        let mut schemas = Vec::new();
+        let mut tables = Vec::new();
+        if let Some(owner) = self.owner_path(id).and_then(|p| self.node(&p)) {
+            for s in &owner.children {
+                if s.kind != NodeKind::Schema {
+                    continue;
+                }
+                schemas.push(s.name.clone());
+                for t in &s.children {
+                    if t.kind == NodeKind::Table {
+                        tables.push((s.name.clone(), t.name.clone()));
+                    }
+                }
+            }
+        }
+        (schemas, tables)
+    }
 
     pub fn project_index(&self, name: &str) -> Option<usize> {
         self.roots.iter().position(|p| p.name == name)
@@ -384,10 +482,12 @@ impl Tree {
     }
 
     pub fn set_state(&mut self, id: ConnId, state: ConnState) {
-        if let Some(node) = self.connection_mut(id) {
-            node.state = state;
-            if state != ConnState::Connecting {
-                node.loading = false;
+        for path in self.owner_paths(id) {
+            if let Some(node) = self.node_mut(&path) {
+                node.state = state;
+                if state != ConnState::Connecting {
+                    node.loading = false;
+                }
             }
         }
     }
@@ -597,5 +697,84 @@ name = "Beta"
         let t = Tree::from_config(&cfg());
         assert_eq!(t.connection_path(2), Some(vec![1, 0]));
         assert_eq!(t.connection_path(9), None);
+    }
+
+    #[test]
+    fn databases_nest_between_connection_and_schema() {
+        let mut t = Tree::from_config(&cfg());
+        // Connection 0 is configured for `d`; `other` is opened beside it.
+        t.set_databases(0, vec![("d".into(), 0), ("other".into(), 9)]);
+        assert_eq!(t.databases(0), vec!["d".to_string(), "other".to_string()]);
+        t.set_schemas(0, vec!["public".into()]);
+        t.set_schemas(9, vec!["audit".into()]);
+        t.set_tables(9, "audit", vec!["events".into()]);
+        let rows = t.rows();
+        let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "Alpha",
+                "a-db",
+                "d",
+                "public",
+                "other",
+                "audit",
+                "events",
+                "a-warehouse",
+                "Beta",
+                "b-db"
+            ]
+        );
+        // The table row speaks through the database's own connection.
+        let events = t.rows().into_iter().find(|r| r.name == "events").unwrap();
+        assert_eq!(events.conn, Some(9));
+        assert_eq!(events.schema.as_deref(), Some("audit"));
+    }
+
+    #[test]
+    fn identifiers_come_from_the_database_a_connection_sits_on() {
+        let mut t = Tree::from_config(&cfg());
+        t.set_databases(0, vec![("d".into(), 0), ("other".into(), 9)]);
+        t.set_schemas(0, vec!["public".into()]);
+        t.set_tables(0, "public", vec!["users".into()]);
+        t.set_schemas(9, vec!["audit".into()]);
+        t.set_tables(9, "audit", vec!["events".into()]);
+        assert_eq!(
+            t.identifiers(0),
+            (
+                vec!["public".to_string()],
+                vec![("public".to_string(), "users".to_string())]
+            )
+        );
+        assert_eq!(
+            t.identifiers(9),
+            (
+                vec!["audit".to_string()],
+                vec![("audit".to_string(), "events".to_string())]
+            )
+        );
+    }
+
+    #[test]
+    fn relisting_databases_keeps_loaded_schemas() {
+        let mut t = Tree::from_config(&cfg());
+        t.set_databases(0, vec![("d".into(), 0)]);
+        t.set_schemas(0, vec!["public".into()]);
+        t.set_databases(0, vec![("d".into(), 0), ("new".into(), 9)]);
+        assert_eq!(t.databases(0), vec!["d".to_string(), "new".to_string()]);
+        assert_eq!(t.identifiers(0).0, vec!["public".to_string()]);
+    }
+
+    #[test]
+    fn a_database_is_not_a_configured_connection() {
+        let mut t = Tree::from_config(&cfg());
+        t.set_databases(0, vec![("d".into(), 0), ("other".into(), 9)]);
+        assert_eq!(t.connection_path(0), Some(vec![0, 0]));
+        assert_eq!(t.connection_path(9), None, "clones are not in the config");
+        // State reaches both the connection and the database it sits on.
+        t.set_state(0, ConnState::Failed);
+        let rows = t.rows();
+        assert_eq!(rows[1].state, ConnState::Failed);
+        assert_eq!(rows[2].state, ConnState::Failed);
     }
 }

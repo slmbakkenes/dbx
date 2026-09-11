@@ -81,6 +81,8 @@ Config lives in `$DBX_CONFIG_DIR`, else `$XDG_CONFIG_HOME/dbx`, else
 page_size = 500          # rows per page of table data, and max rows per query
 max_column_width = 48
 confirm_writes = true    # ask before running anything that is not a read
+auto_complete = true     # completion popup follows typing
+complete_after = 1       # characters typed before it opens by itself
 
 [[project]]
 name = "Acme"
@@ -149,14 +151,17 @@ starting point (also checked in as `keys.example.toml`).
 | `esc` | up one layer — closes an overlay, leaves insert mode, or leaves the pane |
 | `ctrl+t` / `ctrl+e` / `ctrl+g` | jump straight to tree / editor / grid |
 | `ctrl+n` / `ctrl+w` | new query tab / close tab |
+| `ctrl+b` | switch the query tab's database |
 | `alt+h` / `alt+l` | previous / next tab |
 | `ctrl+c` | cancel the running statement |
-| `:` | command line (`:q`, `:limit 200`, `:new`, `:refresh`) |
+| `:` | command line (`:q`, `:limit 200`, `:new`, `:refresh`, `:db <name>`) |
 
-**Tree:** `j/k` move, `l/h` expand/collapse, `enter` open, `s` structure,
+**Tree:** project → connection → database → schema → table. `j/k` move,
+`l/h` expand/collapse, `enter` open, `s` structure,
 `J/K` jump between connections, `/` filter (auto-expands to reveal matches),
 `gg`/`G`, `ctrl+d`/`ctrl+u`, and `a` `A` `e` `D` `t` to manage connections and
-projects (see above).
+projects (see above). On a database row `e` and `D` act on the connection it
+belongs to.
 
 **Grid:** `hjkl`, `0`/`$`, `gg`/`G`, `ctrl+d`/`ctrl+u`, `H`/`L` previous/next
 page, `y` yank cell, `Y` yank row, `enter` inspect a cell full-width, `/` `n`
@@ -164,10 +169,73 @@ page, `y` yank cell, `Y` yank row, `enter` inspect a cell full-width, `/` `n`
 
 **Query editor:** `i/a/I/A/o/O` insert, `esc` normal, `w/b`, `dd`, `x`, `u`,
 `ctrl+r` run the statement under the cursor, `ctrl+a` run the whole buffer,
-`[`/`]` walk query history.
+`[`/`]` walk query history, `ctrl+p` complete.
 
 Yanking uses OSC 52, so it reaches your local clipboard over SSH, and falls
 back to `pbcopy`/`xclip`.
+
+## Completion
+
+The popup follows your typing: one character into a word it is already there,
+and a `.` opens it straight away. `ctrl+p` opens it on demand, in normal or
+insert mode. It never fires a query of its own, so it is instant and works on a
+dropped connection — candidates come from what dbx already knows.
+
+Set `auto_complete = false` to make it chord-only, or raise `complete_after` if
+one character is too eager. `ctrl+space` is bound too, but macOS gives that
+chord to the input-source switch, so it usually never reaches the terminal.
+
+```
+select u.|
+        ┌ 2/3 ─────────────────────┐
+        │col email    public.users │
+        │col id       public.users │
+        │col name     public.users │
+        └──────────────────────────┘
+```
+
+- `tab`/`shift+tab` or `↓`/`↑` cycle, `enter` accepts, `esc` closes the popup
+  and leaves you in insert mode. Typing narrows the list; a `.` re-anchors it.
+  Global chords are never swallowed — `ctrl+h` still leaves for the tree.
+- Nothing is offered inside a string literal or a comment, so `select 'sel` and
+  `-- from` stay quiet.
+- What is offered depends on where the cursor is: after `from`, `join`, `into`
+  or `update` you get tables and schemas; after `alias.`, `table.` or
+  `schema.table.` you get that table's columns; anywhere else, the columns of
+  the tables in the current statement, then tables, then keywords. Aliases are
+  read out of the statement's own `from`/`join` clauses, `as` or not.
+- Keywords are per engine, so `ilike` is Postgres-only and `top` is
+  SQL Server-only.
+- Schemas and tables come from the tree, so they cover the connections you have
+  expanded. Columns come from tables you have opened (data or `s` structure) —
+  open a table once and its columns complete for the rest of the session.
+- Scope is the statement under the cursor, quotes and comments included, so
+  `select | from users` offers `users`' columns even though `from` comes after
+  the cursor.
+
+## Databases
+
+Expanding a connection lists the databases the login can actually reach —
+`pg_database` filtered by `has_database_privilege`, `sys.databases` filtered by
+`has_dbaccess` — not just the one in your config. Each one browses its own
+schemas and tables.
+
+`ctrl+b` in a query tab picks the database that tab runs against; type to
+filter, `enter` switches, `esc` cancels. `:db reporting` does it without the
+picker. Each query tab keeps its own target, so one tab can sit on `staging`
+while another stays on production, and a new tab opens on whatever the current
+one is pointed at. The status bar and the results header both spell out
+`project/connection · database`.
+
+Switching clones the connection in memory with a different `database`, so the
+host, user, TLS settings and password source come along — nothing new to
+configure, and nothing is written to `config.toml`. The clones are session-only
+and disappear with the connection they came from.
+
+Postgres needs a separate connection per database, so switching opens one on
+first use; that is also why an unreachable database only fails when you touch
+it. SQL Server logins that lack `VIEW ANY DATABASE` will see a short list —
+that is the server's answer, not a filter of ours.
 
 ## Troubleshooting
 

@@ -14,6 +14,7 @@
 "ctrl+n"       = "new-query-tab"
 "ctrl+w"       = "close-tab"
 "ctrl+f"       = "toggle-fullscreen"
+"ctrl+b"       = "switch-database"
 "f5"           = "refresh"
 "alt+l"        = "next-tab"
 "alt+h"        = "prev-tab"
@@ -100,6 +101,8 @@
 "ctrl+r"       = "run-statement"
 "ctrl+a"       = "run-all"
 "enter"        = "run-statement"
+"ctrl+p"       = "complete"
+"ctrl+space"   = "complete"
 "["            = "history-prev"
 "]"            = "history-next"
 

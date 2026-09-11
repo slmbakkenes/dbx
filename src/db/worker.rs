@@ -6,6 +6,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 #[derive(Debug, Clone)]
 pub enum DbRequest {
+    Databases,
     Schemas,
     Tables {
         schema: String,
@@ -33,6 +34,7 @@ pub enum DbRequest {
 
 #[derive(Debug, Clone)]
 pub enum DbPayload {
+    Databases(Vec<String>),
     Connected,
     Disconnected(String),
     Schemas(Vec<String>),
@@ -134,6 +136,13 @@ async fn run(
 
         match req {
             DbRequest::Shutdown => {}
+            DbRequest::Databases => match d.databases().await {
+                Ok(v) => emit(DbPayload::Databases(v)),
+                Err(e) => emit(DbPayload::Error {
+                    req: None,
+                    message: format!("{e:#}"),
+                }),
+            },
             DbRequest::Schemas => match d.schemas().await {
                 Ok(v) => emit(DbPayload::Schemas(v)),
                 Err(e) => emit(DbPayload::Error {

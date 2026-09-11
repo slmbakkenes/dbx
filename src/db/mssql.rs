@@ -57,6 +57,16 @@ impl MsDriver {
 
 #[async_trait]
 impl Driver for MsDriver {
+    async fn databases(&mut self) -> Result<Vec<String>> {
+        self.strings(
+            "select d.name from sys.databases d \
+             where d.state = 0 and has_dbaccess(d.name) = 1 \
+             order by d.name",
+            None,
+        )
+        .await
+    }
+
     async fn schemas(&mut self) -> Result<Vec<String>> {
         self.strings(
             "select s.name from sys.schemas s \

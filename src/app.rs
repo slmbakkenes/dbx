@@ -1,5 +1,6 @@
 //! Application state, focus model and action dispatch.
 
+use crate::complete::{self, Completion, Sources};
 use crate::config::{Config, Connection as ConnCfg, UiConfig};
 use crate::db::worker::{ConnHandle, DbEvent, DbPayload, DbRequest, spawn};
 use crate::db::{ConnId, Grid, ReqId, is_read_only, statement_at};
@@ -30,6 +31,47 @@ pub enum Overlay {
     Prompt(PromptKind),
     Confirm(Confirm),
     Form(Box<Form>),
+    /// A modal list to choose from: databases on a server.
+    Picker(Box<Picker>),
+}
+
+/// The database switcher for one query tab.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Picker {
+    pub title: String,
+    /// The configured connection whose server is being browsed.
+    pub base: ConnId,
+    /// The tab that will be retargeted.
+    pub tab: usize,
+    pub items: Vec<String>,
+    pub filter: String,
+    pub selected: usize,
+    /// Waiting on the server's database list.
+    pub loading: bool,
+}
+
+impl Picker {
+    pub fn visible(&self) -> Vec<&str> {
+        let f = self.filter.to_ascii_lowercase();
+        self.items
+            .iter()
+            .filter(|i| i.to_ascii_lowercase().contains(&f))
+            .map(String::as_str)
+            .collect()
+    }
+
+    pub fn step(&mut self, delta: isize) {
+        let n = self.visible().len() as isize;
+        if n == 0 {
+            self.selected = 0;
+            return;
+        }
+        self.selected = (((self.selected as isize + delta) % n + n) % n) as usize;
+    }
+
+    pub fn current(&self) -> Option<String> {
+        self.visible().get(self.selected).map(|s| s.to_string())
+    }
 }
 
 /// Something irreversible, waiting on a yes.
@@ -91,6 +133,9 @@ pub enum TabStatus {
 pub struct ConnEntry {
     pub project: String,
     pub cfg: ConnCfg,
+    /// Set when this is a session-only clone pointed at another database on
+    /// the same server. Such entries are never written back to the config.
+    pub origin: Option<ConnId>,
 }
 
 /// Result of a "test connection", matched back by token so a stale reply is
@@ -113,6 +158,8 @@ pub struct Tab {
     pub status: TabStatus,
     /// Row offset of the current page, for Data tabs.
     pub offset: usize,
+    /// Open completion popup, for Query tabs.
+    pub completion: Option<Completion>,
 }
 
 impl Tab {
@@ -131,6 +178,9 @@ pub struct App {
     pub events_tx: UnboundedSender<DbEvent>,
     pub events_rx: UnboundedReceiver<DbEvent>,
     pub tree: Tree,
+    /// Columns learned from opening a table, keyed by connection and table.
+    /// Only ever read by the completer.
+    columns: HashMap<(ConnId, String, String), Vec<String>>,
     pub tabs: Vec<Tab>,
     pub tab: usize,
     focus: Vec<Focus>,
@@ -145,6 +195,9 @@ pub struct App {
     next_req: ReqId,
     /// Which tab is waiting on which request.
     inflight: HashMap<ReqId, usize>,
+    /// Screen position of the completion popup's top-left, refreshed by the
+    /// renderer each frame.
+    pub completion_anchor: Option<(u16, u16)>,
     /// Viewport heights, refreshed by the renderer each frame.
     pub tree_height: usize,
     pub grid_height: usize,
@@ -171,6 +224,7 @@ impl App {
                 conns.push(Some(ConnEntry {
                     project: p.name.clone(),
                     cfg: c.clone(),
+                    origin: None,
                 }));
             }
         }
@@ -192,6 +246,7 @@ impl App {
             events_tx,
             events_rx,
             tree,
+            columns: HashMap::new(),
             tabs: Vec::new(),
             tab: 0,
             focus: vec![Focus::Tree],
@@ -205,6 +260,7 @@ impl App {
             spinner: 0,
             next_req: 1,
             inflight: HashMap::new(),
+            completion_anchor: None,
             tree_height: 20,
             grid_height: 20,
             editor_height: 8,
@@ -312,6 +368,11 @@ impl App {
             self.prompt_key(kind, ev);
             return;
         }
+        // 2a. The database picker is modal and filters as you type.
+        if matches!(self.overlay, Overlay::Picker(_)) {
+            self.picker_key(ev);
+            return;
+        }
         // 2. The connection form is modal and edits text itself.
         if matches!(self.overlay, Overlay::Form(_)) {
             self.form_key(ev);
@@ -388,6 +449,19 @@ impl App {
         if ctrl {
             return false;
         }
+        if self.active_tab().is_some_and(|t| t.completion.is_some()) && self.completion_key(ev) {
+            return true;
+        }
+        // Typed characters can open the popup, so they are handled before the
+        // borrow the rest of the arms take.
+        if let KeyCode::Char(c) = ev.code {
+            let Some(tab) = self.active_tab_mut() else {
+                return false;
+            };
+            tab.editor.insert_char(c);
+            self.auto_complete(c);
+            return true;
+        }
         let Some(tab) = self.active_tab_mut() else {
             return false;
         };
@@ -410,10 +484,6 @@ impl App {
                 }
                 true
             }
-            KeyCode::Char(c) => {
-                tab.editor.insert_char(c);
-                true
-            }
             KeyCode::Left => {
                 tab.editor.move_col(-1);
                 true
@@ -432,6 +502,347 @@ impl App {
             }
             _ => false,
         }
+    }
+
+    // --- databases ---
+
+    /// The configured connection behind an id, which may be a session-only
+    /// clone pointed at another database.
+    pub fn base_conn(&self, id: ConnId) -> ConnId {
+        self.conn(id).and_then(|e| e.origin).unwrap_or(id)
+    }
+
+    /// The database an id talks to.
+    pub fn database_of(&self, id: ConnId) -> Option<&str> {
+        self.conn(id).map(|e| e.cfg.database.as_str())
+    }
+
+    /// Session-only clones of a configured connection.
+    fn derived_of(&self, base: ConnId) -> Vec<ConnId> {
+        self.conns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.as_ref().is_some_and(|e| e.origin == Some(base)))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Drops the clones of a connection, and anything pointing at them.
+    fn forget_derived(&mut self, base: ConnId) {
+        for id in self.derived_of(base) {
+            self.drop_connection(id);
+            self.tabs.retain(|t| t.conn != id);
+            if let Some(slot) = self.conns.get_mut(id) {
+                *slot = None;
+            }
+        }
+        if self.tab >= self.tabs.len() {
+            self.tab = self.tabs.len().saturating_sub(1);
+        }
+    }
+
+    /// The id that talks to `database` on `base`'s server, cloning the
+    /// configured connection the first time one is asked for. The clone lives
+    /// for this session only and is never written to the config.
+    fn conn_for_database(&mut self, base: ConnId, database: &str) -> Option<ConnId> {
+        let base = self.base_conn(base);
+        let entry = self.conn(base)?;
+        if entry.cfg.database == database {
+            return Some(base);
+        }
+        if let Some(id) = self
+            .derived_of(base)
+            .into_iter()
+            .find(|id| self.conn(*id).is_some_and(|e| e.cfg.database == database))
+        {
+            return Some(id);
+        }
+        let mut cfg = entry.cfg.clone();
+        cfg.database = database.to_string();
+        let project = entry.project.clone();
+        self.conns.push(Some(ConnEntry {
+            project,
+            cfg,
+            origin: Some(base),
+        }));
+        Some(self.conns.len() - 1)
+    }
+
+    /// `ctrl+b`: pick the database the active query tab runs against.
+    fn open_database_picker(&mut self) {
+        let Some(tab) = self.active_tab() else {
+            self.error("no open tabs — press ctrl+n for a query tab");
+            return;
+        };
+        if tab.kind != TabKind::Query {
+            self.error("switching databases applies to query tabs");
+            return;
+        }
+        let base = self.base_conn(tab.conn);
+        let current = self.database_of(tab.conn).unwrap_or_default().to_string();
+        // Databases already listed in the tree need no round trip.
+        let items = self.tree.databases(base);
+        let selected = items.iter().position(|d| *d == current).unwrap_or(0);
+        let loading = items.is_empty();
+        self.overlay = Overlay::Picker(Box::new(Picker {
+            title: format!("database — {}", self.conn_label(base)),
+            base,
+            tab: self.tab,
+            items,
+            filter: String::new(),
+            selected,
+            loading,
+        }));
+        if loading {
+            self.request(base, DbRequest::Databases);
+        }
+    }
+
+    /// Points a query tab at another database on the same server.
+    fn switch_database(&mut self, tab_idx: usize, database: &str) {
+        let Some(base) = self.tabs.get(tab_idx).map(|t| self.base_conn(t.conn)) else {
+            return;
+        };
+        let Some(id) = self.conn_for_database(base, database) else {
+            self.error("that connection is gone");
+            return;
+        };
+        let label = self.conn_label(id);
+        if let Some(tab) = self.tabs.get_mut(tab_idx) {
+            tab.conn = id;
+            tab.conn_name = label;
+            tab.completion = None;
+            tab.status = TabStatus::Idle;
+        }
+        // Warm the metadata for the new target so completion has something to
+        // offer straight away.
+        if !self.tree.is_loaded(id) {
+            self.request(id, DbRequest::Schemas);
+        }
+        self.info(format!("query tab → {database}"));
+    }
+
+    fn picker_key(&mut self, ev: KeyEvent) {
+        let Overlay::Picker(p) = &mut self.overlay else {
+            return;
+        };
+        match ev.code {
+            KeyCode::Esc => self.overlay = Overlay::None,
+            KeyCode::Enter => {
+                let (chosen, tab) = (p.current(), p.tab);
+                self.overlay = Overlay::None;
+                match chosen {
+                    Some(db) => self.switch_database(tab, &db),
+                    None => self.info("nothing to pick"),
+                }
+            }
+            KeyCode::Tab | KeyCode::Down => p.step(1),
+            KeyCode::BackTab | KeyCode::Up => p.step(-1),
+            KeyCode::Backspace => {
+                p.filter.pop();
+                p.selected = 0;
+            }
+            KeyCode::Char(c) => {
+                p.filter.push(c);
+                p.selected = 0;
+            }
+            _ => {}
+        }
+    }
+
+    // --- completion ---
+
+    /// Keys the popup owns while it is open. Returns false for anything else,
+    /// which closes the popup and lets the key take its normal course.
+    fn completion_key(&mut self, ev: KeyEvent) -> bool {
+        match ev.code {
+            KeyCode::Esc => {
+                self.complete_close();
+                true
+            }
+            KeyCode::Enter => {
+                self.complete_accept();
+                true
+            }
+            KeyCode::Tab | KeyCode::Down => {
+                self.complete_step(1);
+                true
+            }
+            KeyCode::BackTab | KeyCode::Up => {
+                self.complete_step(-1);
+                true
+            }
+            // Typing narrows the list; a dot re-anchors it on what came before.
+            KeyCode::Char(c) if complete::is_ident_char(c) || c == '.' => {
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.editor.insert_char(c);
+                }
+                self.complete_refresh(false);
+                true
+            }
+            KeyCode::Backspace => {
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.editor.backspace();
+                }
+                self.complete_refresh(false);
+                true
+            }
+            _ => {
+                self.complete_close();
+                false
+            }
+        }
+    }
+
+    /// Opens the popup while typing, the way a query editor is expected to.
+    /// Quiet by design: an empty candidate list leaves no popup behind.
+    fn auto_complete(&mut self, typed: char) {
+        if !self.ui.auto_complete || self.focus() != Focus::Editor {
+            return;
+        }
+        // A dot is a completion request in itself; a letter has to reach the
+        // configured width first.
+        if typed != '.' {
+            if !complete::is_ident_char(typed) {
+                return;
+            }
+            let min = self.ui.complete_after.max(1);
+            let wide_enough = self.active_tab().is_some_and(|t| {
+                let e = &t.editor;
+                e.col - complete::word_start_col(&e.lines[e.line], e.col) >= min
+            });
+            if !wide_enough {
+                return;
+            }
+        }
+        self.complete_refresh(false);
+    }
+
+    /// The completion chord: opens the popup, or steps it when already open.
+    fn complete_trigger(&mut self) {
+        if self.focus() != Focus::Editor {
+            return;
+        }
+        if self.active_tab().is_some_and(|t| t.completion.is_some()) {
+            self.complete_step(1);
+            return;
+        }
+        // Completion is an insert-mode affair, so step into insert first —
+        // after the current character when the cursor rests on a word.
+        if let Some(tab) = self.active_tab_mut()
+            && tab.kind == TabKind::Query
+            && tab.editor.mode == Mode::Normal
+        {
+            let e = &mut tab.editor;
+            if e.lines[e.line]
+                .chars()
+                .nth(e.col)
+                .is_some_and(complete::is_ident_char)
+            {
+                e.enter_insert_after();
+            } else {
+                e.enter_insert();
+            }
+        }
+        self.complete_refresh(true);
+    }
+
+    /// Rebuilds the candidate list for the cursor. `announce` reports an empty
+    /// result, so an explicit trigger says something and typing stays quiet.
+    fn complete_refresh(&mut self, announce: bool) {
+        let Some(tab) = self.active_tab() else {
+            return;
+        };
+        if tab.kind != TabKind::Query {
+            return;
+        }
+        let Some(src) = self.completion_sources(tab.conn) else {
+            return;
+        };
+        let e = &tab.editor;
+        let (line, col) = (e.line, e.col);
+        let start_col = complete::word_start_col(&e.lines[line], col);
+        let items = complete::candidates(&e.text(), e.byte_cursor(), &src);
+        let empty = items.is_empty();
+        if let Some(tab) = self.active_tab_mut() {
+            tab.completion = if empty {
+                None
+            } else {
+                Some(Completion::new(items, line, start_col))
+            };
+        }
+        if empty && announce {
+            self.info("no completions");
+        }
+    }
+
+    /// Everything already known about a connection, for the completer.
+    fn completion_sources(&self, conn: ConnId) -> Option<Sources> {
+        let engine = self.conn(conn)?.cfg.engine;
+        let (schemas, tables) = self.tree.identifiers(conn);
+        let columns = self
+            .columns
+            .iter()
+            .filter(|((id, _, _), _)| *id == conn)
+            .map(|((_, s, t), cols)| ((s.clone(), t.clone()), cols.clone()))
+            .collect();
+        Some(Sources {
+            engine,
+            schemas,
+            tables,
+            columns,
+        })
+    }
+
+    fn complete_step(&mut self, delta: isize) {
+        if let Some(c) = self.active_tab_mut().and_then(|t| t.completion.as_mut()) {
+            c.step(delta);
+        }
+    }
+
+    fn complete_accept(&mut self) {
+        let Some(tab) = self.active_tab_mut() else {
+            return;
+        };
+        let Some(c) = tab.completion.take() else {
+            return;
+        };
+        let Some(item) = c.items.get(c.selected) else {
+            return;
+        };
+        // The buffer can have moved on under a stale popup; only replace what
+        // the popup was actually anchored to.
+        if c.line == tab.editor.line && c.start_col <= tab.editor.col {
+            let text = item.text.clone();
+            tab.editor.replace_to_cursor(c.start_col, &text);
+        }
+    }
+
+    fn complete_close(&mut self) {
+        if let Some(tab) = self.active_tab_mut() {
+            tab.completion = None;
+        }
+    }
+
+    /// Remembers a table's columns so completion can offer them later.
+    fn remember_columns(&mut self, conn: ConnId, kind: &TabKind, grid: &Grid) {
+        let (schema, table, cols) = match kind {
+            TabKind::Data { schema, table } => (schema, table, grid.columns.clone()),
+            TabKind::Structure { schema, table } => (
+                schema,
+                table,
+                grid.rows
+                    .iter()
+                    .filter_map(|r| r.first().cloned().flatten())
+                    .collect(),
+            ),
+            TabKind::Query => return,
+        };
+        if cols.is_empty() {
+            return;
+        }
+        self.columns
+            .insert((conn, schema.clone(), table.clone()), cols);
     }
 
     fn prompt_key(&mut self, kind: PromptKind, ev: KeyEvent) {
@@ -482,6 +893,9 @@ impl App {
 
     pub fn dispatch(&mut self, action: Action) {
         use Action::*;
+        if action != Complete {
+            self.complete_close();
+        }
         match action {
             Quit => self.quit = true,
             Help => {
@@ -594,6 +1008,8 @@ impl App {
             RunAll => self.run_editor(true),
             HistoryPrev => self.history_step(true),
             HistoryNext => self.history_step(false),
+            Complete => self.complete_trigger(),
+            SwitchDatabase => self.open_database_picker(),
         }
     }
 
@@ -747,7 +1163,9 @@ impl App {
             if !row.has_children_slot {
                 return;
             }
-            if row.kind == NodeKind::Connection && !self.tree.node(&row.path).unwrap().loaded {
+            if matches!(row.kind, NodeKind::Connection | NodeKind::Database)
+                && !self.tree.node(&row.path).unwrap().loaded
+            {
                 self.load_children(&row);
                 return;
             }
@@ -791,6 +1209,13 @@ impl App {
                     n.loading = true;
                     n.state = ConnState::Connecting;
                 }
+                self.request(conn, DbRequest::Databases);
+            }
+            NodeKind::Database => {
+                if let Some(n) = self.tree.node_mut(&row.path) {
+                    n.loading = true;
+                    n.state = ConnState::Connecting;
+                }
                 self.request(conn, DbRequest::Schemas);
             }
             NodeKind::Schema => {
@@ -810,7 +1235,7 @@ impl App {
         };
         match row.kind {
             NodeKind::Project => self.tree_toggle(),
-            NodeKind::Connection | NodeKind::Schema => {
+            NodeKind::Connection | NodeKind::Database | NodeKind::Schema => {
                 let loaded = self.tree.node(&row.path).map(|n| n.loaded).unwrap_or(false);
                 if loaded {
                     self.tree_toggle();
@@ -850,6 +1275,7 @@ impl App {
         self.conns
             .iter()
             .flatten()
+            .filter(|e| e.origin.is_none())
             .map(|e| (e.project.clone(), e.cfg.name.clone()))
             .collect()
     }
@@ -884,6 +1310,7 @@ impl App {
                     last_sql: String::new(),
                     status: TabStatus::Idle,
                     offset: 0,
+                    completion: None,
                 });
                 self.tabs.len() - 1
             }
@@ -956,6 +1383,7 @@ impl App {
             last_sql: String::new(),
             status: TabStatus::Idle,
             offset: 0,
+            completion: None,
         });
         self.tab = self.tabs.len() - 1;
         self.reset_focus(Focus::Tree);
@@ -1125,6 +1553,17 @@ impl App {
             "r" | "refresh" => self.refresh(),
             "new" | "tabnew" => self.new_query_tab(),
             "close" | "tabclose" => self.close_tab(),
+            "db" | "database" => {
+                let name = rest.trim();
+                if name.is_empty() {
+                    self.open_database_picker();
+                } else if self.active_tab().is_some_and(|t| t.kind == TabKind::Query) {
+                    let idx = self.tab;
+                    self.switch_database(idx, name);
+                } else {
+                    self.error("switching databases applies to query tabs");
+                }
+            }
             "limit" => match rest.trim().parse::<usize>() {
                 Ok(n) if n > 0 => {
                     self.ui.page_size = n;
@@ -1167,7 +1606,7 @@ impl App {
             self.overlay = Overlay::Form(Box::new(form));
             return;
         }
-        let Some(id) = row.conn else {
+        let Some(id) = row.conn.map(|c| self.base_conn(c)) else {
             self.error("select a connection to edit");
             return;
         };
@@ -1314,6 +1753,7 @@ impl App {
         self.conns.push(Some(ConnEntry {
             project: project.clone(),
             cfg: conn.clone(),
+            origin: None,
         }));
         self.tree
             .add_connection(&project, &conn.name, conn.engine, id);
@@ -1328,8 +1768,9 @@ impl App {
         form: &Form,
     ) -> anyhow::Result<String> {
         let Some(id) = self.conns.iter().position(|c| {
-            c.as_ref()
-                .is_some_and(|e| e.project == old_project && e.cfg.name == old_name)
+            c.as_ref().is_some_and(|e| {
+                e.origin.is_none() && e.project == old_project && e.cfg.name == old_name
+            })
         }) else {
             anyhow::bail!("{old_project}/{old_name} is no longer in the config");
         };
@@ -1361,11 +1802,13 @@ impl App {
         self.conns[id] = Some(ConnEntry {
             project: project.clone(),
             cfg: conn.clone(),
+            origin: None,
         });
         self.tree
             .update_connection(id, &project, &conn.name, conn.engine);
         if repoint {
             self.drop_connection(id);
+            self.forget_derived(id);
             self.tree.reset_connection_children(id);
         }
         for tab in self.tabs.iter_mut().filter(|t| t.conn == id) {
@@ -1399,7 +1842,7 @@ impl App {
                     .conns
                     .iter()
                     .flatten()
-                    .filter(|e| e.project == row.name)
+                    .filter(|e| e.origin.is_none() && e.project == row.name)
                     .map(|e| e.cfg.name.clone())
                     .collect();
                 self.overlay = Overlay::Confirm(Confirm::DeleteProject {
@@ -1408,7 +1851,7 @@ impl App {
                 });
             }
             _ => {
-                let Some(id) = row.conn else {
+                let Some(id) = row.conn.map(|c| self.base_conn(c)) else {
                     self.error("select a connection or project to delete");
                     return;
                 };
@@ -1481,6 +1924,7 @@ impl App {
     /// Closes the worker and any tabs belonging to a connection that is going
     /// away, without disturbing other connections' ids.
     fn forget_connection_state(&mut self, id: ConnId) {
+        self.forget_derived(id);
         self.drop_connection(id);
         self.tabs.retain(|t| t.conn != id);
         if self.tab >= self.tabs.len() {
@@ -1599,6 +2043,28 @@ impl App {
                 self.tree.set_state(ev.conn, ConnState::Idle);
                 self.info(format!("{}: {why}", self.conn_label(ev.conn)));
             }
+            DbPayload::Databases(list) => {
+                let base = self.base_conn(ev.conn);
+                let mut mapped = Vec::with_capacity(list.len());
+                for name in &list {
+                    let id = self.conn_for_database(base, name).unwrap_or(base);
+                    mapped.push((name.clone(), id));
+                }
+                self.tree.set_databases(base, mapped);
+                self.tree.clamp();
+                if let Overlay::Picker(p) = &mut self.overlay
+                    && p.base == base
+                {
+                    p.items = list.clone();
+                    p.loading = false;
+                    p.selected = 0;
+                }
+                self.info(format!(
+                    "{}: {} databases",
+                    self.conn_label(base),
+                    list.len()
+                ));
+            }
             DbPayload::Schemas(list) => {
                 let n = list.len();
                 self.tree.set_schemas(ev.conn, list);
@@ -1614,6 +2080,10 @@ impl App {
                     return;
                 };
                 let summary = summarise(&grid);
+                if let Some(tab) = self.tabs.get(idx) {
+                    let (conn, kind) = (tab.conn, tab.kind.clone());
+                    self.remember_columns(conn, &kind, &grid);
+                }
                 if let Some(tab) = self.tabs.get_mut(idx) {
                     if tab.status == TabStatus::Running(req) {
                         tab.status = TabStatus::Idle;
@@ -1740,6 +2210,7 @@ name = "Beta"
             last_sql: String::new(),
             status: TabStatus::Idle,
             offset: 0,
+            completion: None,
         });
         app.tab = app.tabs.len() - 1;
         app.tabs[0].view.set_grid(fake_grid());
@@ -2028,6 +2499,7 @@ name = "Beta"
             last_sql: String::new(),
             status: TabStatus::Idle,
             offset: 0,
+            completion: None,
         });
         app.apply_confirmed(Confirm::DeleteConnection {
             id: 0,
@@ -2486,5 +2958,305 @@ name = "Beta"
         });
         let names: Vec<String> = app.tree.rows().iter().map(|r| r.name.clone()).collect();
         assert!(names.contains(&"public".to_string()));
+    }
+
+    /// Teaches the tree what a connection holds, the way a schema and table
+    /// load would.
+    fn load_fake_metadata(app: &mut App) {
+        app.tree.set_schemas(0, vec!["public".into()]);
+        app.tree.set_tables(0, "public", vec!["users".into()]);
+    }
+
+    fn texts(c: &Completion) -> Vec<&str> {
+        c.items.iter().map(|i| i.text.as_str()).collect()
+    }
+
+    fn completion(app: &App) -> &Completion {
+        app.active_tab()
+            .unwrap()
+            .completion
+            .as_ref()
+            .expect("popup should be open")
+    }
+
+    #[test]
+    fn completion_offers_loaded_tables_and_accepts_one() {
+        let mut app = app();
+        load_fake_metadata(&mut app);
+        app.dispatch(Action::NewQueryTab);
+        type_str(&mut app, "select * from us");
+        key(&mut app, "ctrl+space");
+        assert_eq!(completion(&app).items[0].text, "users");
+        key(&mut app, "enter");
+        let tab = app.active_tab().unwrap();
+        assert_eq!(tab.editor.text(), "select * from users");
+        assert!(tab.completion.is_none());
+        assert_eq!(tab.editor.mode, Mode::Insert);
+    }
+
+    #[test]
+    fn typing_narrows_the_popup_and_esc_closes_it_without_leaving_insert() {
+        let mut app = app();
+        load_fake_metadata(&mut app);
+        app.dispatch(Action::NewQueryTab);
+        type_str(&mut app, "select ");
+        key(&mut app, "ctrl+space");
+        type_str(&mut app, "fro");
+        assert_eq!(completion(&app).items[0].text, "from");
+        assert_eq!(app.active_tab().unwrap().editor.text(), "select fro");
+        key(&mut app, "esc");
+        let tab = app.active_tab().unwrap();
+        assert!(tab.completion.is_none());
+        assert_eq!(tab.editor.mode, Mode::Insert, "esc closes the popup only");
+    }
+
+    #[test]
+    fn columns_from_an_opened_table_feed_the_popup() {
+        let mut app = app();
+        load_fake_metadata(&mut app);
+        open_fake_table(&mut app);
+        app.inflight.insert(9, 0);
+        app.on_db_event(DbEvent {
+            conn: 0,
+            payload: DbPayload::Result {
+                req: 9,
+                grid: fake_grid(),
+                sql: None,
+            },
+        });
+        app.dispatch(Action::NewQueryTab);
+        type_str(&mut app, "select users.i");
+        key(&mut app, "ctrl+space");
+        assert_eq!(completion(&app).items[0].text, "id");
+    }
+
+    #[test]
+    fn triggering_from_normal_mode_completes_the_word_under_the_cursor() {
+        let mut app = app();
+        load_fake_metadata(&mut app);
+        app.dispatch(Action::NewQueryTab);
+        type_str(&mut app, "select * from use");
+        key(&mut app, "esc");
+        key(&mut app, "ctrl+space");
+        key(&mut app, "enter");
+        assert_eq!(
+            app.active_tab().unwrap().editor.text(),
+            "select * from users"
+        );
+    }
+
+    #[test]
+    fn nothing_to_complete_says_so_and_opens_no_popup() {
+        let mut app = app();
+        app.dispatch(Action::NewQueryTab);
+        type_str(&mut app, "zzz");
+        key(&mut app, "ctrl+space");
+        assert!(app.active_tab().unwrap().completion.is_none());
+        assert_eq!(app.message.as_ref().unwrap().0, MsgKind::Info);
+    }
+
+    #[test]
+    fn an_open_popup_never_traps_a_global_chord() {
+        let mut app = app();
+        load_fake_metadata(&mut app);
+        app.dispatch(Action::NewQueryTab);
+        type_str(&mut app, "select ");
+        key(&mut app, "ctrl+space");
+        key(&mut app, "ctrl+h");
+        assert_eq!(app.focus(), Focus::Tree);
+        assert!(app.tabs[0].completion.is_none());
+    }
+
+    #[test]
+    fn the_popup_follows_typing() {
+        let mut app = app();
+        load_fake_metadata(&mut app);
+        app.dispatch(Action::NewQueryTab);
+        type_str(&mut app, "s");
+        assert!(
+            texts(completion(&app)).contains(&"select"),
+            "one character should be enough"
+        );
+        type_str(&mut app, "elect * from us");
+        assert_eq!(completion(&app).items[0].text, "users");
+        key(&mut app, "enter");
+        assert_eq!(
+            app.active_tab().unwrap().editor.text(),
+            "select * from users"
+        );
+    }
+
+    #[test]
+    fn auto_complete_can_be_turned_off() {
+        let mut app = app();
+        load_fake_metadata(&mut app);
+        app.ui.auto_complete = false;
+        app.dispatch(Action::NewQueryTab);
+        type_str(&mut app, "sel");
+        assert!(app.active_tab().unwrap().completion.is_none());
+        // The chord still works with auto-open off.
+        key(&mut app, "ctrl+p");
+        assert!(texts(completion(&app)).contains(&"select"));
+    }
+
+    #[test]
+    fn complete_after_holds_the_popup_back() {
+        let mut app = app();
+        app.ui.complete_after = 3;
+        app.dispatch(Action::NewQueryTab);
+        type_str(&mut app, "se");
+        assert!(app.active_tab().unwrap().completion.is_none());
+        type_str(&mut app, "l");
+        assert!(texts(completion(&app)).contains(&"select"));
+    }
+
+    #[test]
+    fn a_dot_opens_the_popup_whatever_the_threshold() {
+        let mut app = app();
+        load_fake_metadata(&mut app);
+        app.ui.complete_after = 99;
+        app.dispatch(Action::NewQueryTab);
+        type_str(&mut app, "select * from public");
+        assert!(app.active_tab().unwrap().completion.is_none());
+        type_str(&mut app, ".");
+        assert_eq!(texts(completion(&app)), vec!["users"]);
+    }
+
+    #[test]
+    fn typing_a_string_literal_never_opens_the_popup() {
+        let mut app = app();
+        load_fake_metadata(&mut app);
+        app.dispatch(Action::NewQueryTab);
+        type_str(&mut app, "select 'sel");
+        assert!(app.active_tab().unwrap().completion.is_none());
+        type_str(&mut app, "' , sel");
+        assert!(texts(completion(&app)).contains(&"select"));
+    }
+
+    fn picker(app: &App) -> &Picker {
+        let Overlay::Picker(p) = &app.overlay else {
+            panic!("picker should be open, got {:?}", app.overlay);
+        };
+        p
+    }
+
+    /// The database list a server would have sent.
+    fn databases_arrive(app: &mut App, conn: ConnId, names: &[&str]) {
+        app.on_db_event(DbEvent {
+            conn,
+            payload: DbPayload::Databases(names.iter().map(|s| s.to_string()).collect()),
+        });
+    }
+
+    #[tokio::test]
+    async fn listing_databases_clones_the_connection_once_per_database() {
+        let mut app = app();
+        databases_arrive(&mut app, 0, &["d", "reporting", "staging"]);
+        assert_eq!(app.tree.databases(0), ["d", "reporting", "staging"]);
+        // The configured database keeps the connection's own id; the others
+        // get session-only clones.
+        assert_eq!(app.conn_for_database(0, "d"), Some(0));
+        let reporting = app.conn_for_database(0, "reporting").unwrap();
+        assert_ne!(reporting, 0);
+        let entry = app.conn(reporting).unwrap();
+        assert_eq!(entry.cfg.database, "reporting");
+        assert_eq!(entry.cfg.host, "h", "the server details are inherited");
+        assert_eq!(entry.origin, Some(0));
+
+        // Relisting reuses them instead of piling up.
+        let before = app.conns.len();
+        databases_arrive(&mut app, 0, &["d", "reporting", "staging"]);
+        assert_eq!(app.conns.len(), before);
+        assert_eq!(app.conn_for_database(0, "reporting"), Some(reporting));
+    }
+
+    #[tokio::test]
+    async fn the_picker_filters_and_retargets_the_query_tab() {
+        let mut app = app();
+        databases_arrive(&mut app, 0, &["d", "reporting", "staging"]);
+        app.dispatch(Action::NewQueryTab);
+        key(&mut app, "ctrl+b");
+        assert_eq!(picker(&app).items.len(), 3);
+        assert!(!picker(&app).loading, "the tree already had the list");
+        type_str(&mut app, "rep");
+        assert_eq!(picker(&app).visible(), ["reporting"]);
+        key(&mut app, "enter");
+        assert_eq!(app.overlay, Overlay::None);
+        let tab = app.active_tab().unwrap();
+        assert_eq!(app.database_of(tab.conn), Some("reporting"));
+        assert_eq!(app.base_conn(tab.conn), 0);
+    }
+
+    #[tokio::test]
+    async fn the_picker_asks_the_server_when_the_tree_has_no_list() {
+        let mut app = app();
+        app.dispatch(Action::NewQueryTab);
+        key(&mut app, "ctrl+b");
+        assert!(picker(&app).loading);
+        databases_arrive(&mut app, 0, &["d", "reporting"]);
+        assert!(!picker(&app).loading);
+        assert_eq!(picker(&app).items, ["d", "reporting"]);
+        key(&mut app, "esc");
+        assert_eq!(app.overlay, Overlay::None);
+    }
+
+    #[tokio::test]
+    async fn db_command_switches_without_the_picker() {
+        let mut app = app();
+        databases_arrive(&mut app, 0, &["d", "reporting"]);
+        app.dispatch(Action::NewQueryTab);
+        app.run_command("db reporting");
+        assert_eq!(
+            app.database_of(app.active_tab().unwrap().conn),
+            Some("reporting")
+        );
+    }
+
+    #[test]
+    fn switching_databases_is_refused_on_a_table_tab() {
+        let mut app = app();
+        open_fake_table(&mut app);
+        app.dispatch(Action::SwitchDatabase);
+        assert_eq!(app.overlay, Overlay::None);
+        assert_eq!(app.message.as_ref().unwrap().0, MsgKind::Error);
+    }
+
+    #[tokio::test]
+    async fn each_tab_keeps_its_own_database() {
+        let mut app = app();
+        databases_arrive(&mut app, 0, &["d", "reporting"]);
+        app.dispatch(Action::NewQueryTab);
+        app.dispatch(Action::NewQueryTab);
+        app.run_command("db reporting");
+        assert_eq!(app.database_of(app.tabs[0].conn), Some("d"));
+        assert_eq!(app.database_of(app.tabs[1].conn), Some("reporting"));
+        // A new tab opens on whatever the current one is pointed at.
+        app.dispatch(Action::NewQueryTab);
+        assert_eq!(app.database_of(app.tabs[2].conn), Some("reporting"));
+    }
+
+    #[tokio::test]
+    async fn clones_stay_out_of_the_config_and_go_with_their_connection() {
+        let (_p, mut app) = app_with_file();
+        databases_arrive(&mut app, 0, &["d", "reporting"]);
+        app.dispatch(Action::NewQueryTab);
+        app.run_command("db reporting");
+        let clone = app.active_tab().unwrap().conn;
+        assert_eq!(
+            app.existing_pairs()
+                .iter()
+                .filter(|(_, name)| name == "a-db")
+                .count(),
+            1,
+            "a clone must not double up the connection's name"
+        );
+        app.apply_confirmed(Confirm::DeleteConnection {
+            id: 0,
+            project: "Alpha".into(),
+            name: "a-db".into(),
+            account: None,
+        });
+        assert!(app.conn(clone).is_none(), "the clone went with it");
+        assert!(app.tabs.iter().all(|t| t.conn != clone));
     }
 }

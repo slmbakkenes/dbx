@@ -80,6 +80,8 @@ pub enum Action {
     WordBack,
     HistoryPrev,
     HistoryNext,
+    Complete,
+    SwitchDatabase,
 }
 
 impl Action {
@@ -151,6 +153,8 @@ impl Action {
             WordBack => "word-back",
             HistoryPrev => "history-prev",
             HistoryNext => "history-next",
+            Complete => "complete",
+            SwitchDatabase => "switch-database",
         }
     }
 
@@ -222,6 +226,8 @@ impl Action {
             WordBack,
             HistoryPrev,
             HistoryNext,
+            Complete,
+            SwitchDatabase,
         ]
     }
 }
@@ -480,6 +486,7 @@ pub fn default_keymap() -> Keymap {
         (Global, "ctrl+n", NewQueryTab),
         (Global, "ctrl+w", CloseTab),
         (Global, "ctrl+f", ToggleFullscreen),
+        (Global, "ctrl+b", SwitchDatabase),
         (Global, "f5", Refresh),
         (Global, "alt+l", NextTab),
         (Global, "alt+h", PrevTab),
@@ -563,6 +570,10 @@ pub fn default_keymap() -> Keymap {
         (Editor, "ctrl+r", RunStatement),
         (Editor, "ctrl+a", RunAll),
         (Editor, "enter", RunStatement),
+        (Editor, "ctrl+p", Complete),
+        // macOS binds ctrl+space to the input-source switch, so it may never
+        // arrive; it stays bound for terminals that do send it.
+        (Editor, "ctrl+space", Complete),
         (Editor, "[", HistoryPrev),
         (Editor, "]", HistoryNext),
     ];

@@ -66,6 +66,8 @@ pub struct ColumnMeta {
 
 #[async_trait]
 pub trait Driver: Send {
+    /// Databases on this server that the login may connect to.
+    async fn databases(&mut self) -> Result<Vec<String>>;
     async fn schemas(&mut self) -> Result<Vec<String>>;
     async fn tables(&mut self, schema: &str) -> Result<Vec<String>>;
     async fn columns(&mut self, schema: &str, table: &str) -> Result<Grid>;

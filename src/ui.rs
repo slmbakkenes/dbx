@@ -1,6 +1,6 @@
 //! Rendering. Layout is tree | workspace, with a one-line status bar.
 
-use crate::app::{App, Confirm, Focus, MsgKind, Overlay, Tab, TabKind, TabStatus};
+use crate::app::{App, Confirm, Focus, MsgKind, Overlay, Picker, Tab, TabKind, TabStatus};
 use crate::editor::Mode;
 use crate::form::{FieldKind, Form, TestState};
 use crate::keys::{Action, Context};
@@ -54,6 +54,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
     draw_workspace(f, cols[1], app);
     draw_status(f, status, app);
+    draw_completion(f, body, app);
 
     match app.overlay.clone() {
         Overlay::None => {}
@@ -61,6 +62,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Overlay::Inspect(text) => draw_inspect(f, f.area(), &text),
         Overlay::Confirm(what) => draw_confirm(f, f.area(), &what),
         Overlay::Form(form) => draw_form(f, f.area(), &form),
+        Overlay::Picker(p) => draw_picker(f, f.area(), &p),
         Overlay::Prompt(_) => {}
     }
 }
@@ -119,12 +121,13 @@ fn draw_tree(f: &mut Frame, area: Rect, app: &mut App) {
                 ConnState::Failed => "✗",
                 _ => "○",
             },
+            NodeKind::Database => "◈",
             NodeKind::Schema => "◇",
             NodeKind::Table => "▤",
         };
         let name_style = match row.kind {
             NodeKind::Project => Style::default().fg(T.accent).add_modifier(Modifier::BOLD),
-            NodeKind::Connection => match row.state {
+            NodeKind::Connection | NodeKind::Database => match row.state {
                 ConnState::Connected => Style::default().fg(T.ok),
                 ConnState::Failed => Style::default().fg(T.err),
                 _ => Style::default(),
@@ -290,6 +293,96 @@ fn draw_editor(f: &mut Frame, area: Rect, app: &mut App) {
             f.set_cursor_position((cx, cy));
         }
     }
+
+    // The popup is drawn last, over the grid if it has to be, so remember
+    // where it hangs from: the start of the word being completed.
+    let tab = &app.tabs[app.tab];
+    app.completion_anchor = tab.completion.as_ref().and_then(|c| {
+        (focused && c.line >= off).then(|| {
+            (
+                inner.x + gutter as u16 + c.start_col as u16,
+                inner.y + (c.line - off) as u16,
+            )
+        })
+    });
+}
+
+const POPUP_ROWS: usize = 8;
+
+fn draw_completion(f: &mut Frame, area: Rect, app: &mut App) {
+    let Some((ax, ay)) = app.completion_anchor else {
+        return;
+    };
+    let Some(c) = app
+        .tabs
+        .get_mut(app.tab)
+        .and_then(|t| t.completion.as_mut())
+    else {
+        return;
+    };
+    let rows = c.items.len().min(POPUP_ROWS);
+    c.scroll_into_view(rows);
+    let visible: Vec<_> = c.items.iter().skip(c.scroll).take(rows).collect();
+    let name_w = visible
+        .iter()
+        .map(|i| i.text.chars().count())
+        .max()
+        .unwrap_or(0)
+        .clamp(8, 34);
+    let detail_w = visible
+        .iter()
+        .map(|i| i.detail.chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(20);
+    let width = (name_w + detail_w + 9).min(area.width as usize) as u16;
+    let height = rows as u16 + 2;
+    // Below the cursor when it fits, above when it does not.
+    let y = if ay + 1 + height <= area.bottom() {
+        ay + 1
+    } else {
+        ay.saturating_sub(height)
+    };
+    let x = ax.min(area.right().saturating_sub(width));
+    let rect = Rect {
+        x,
+        y,
+        width,
+        height,
+    }
+    .intersection(area);
+    let block = Block::bordered()
+        .border_style(Style::default().fg(T.dim))
+        .title(Span::styled(
+            format!(" {}/{} ", c.selected + 1, c.items.len()),
+            Style::default().fg(T.dim),
+        ));
+    let inner = block.inner(rect);
+    let lines: Vec<Line> = visible
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let selected = c.scroll + i == c.selected;
+            let row = if selected {
+                Style::default().bg(T.accent).fg(Color::Black)
+            } else {
+                Style::default()
+            };
+            let dim = if selected {
+                row
+            } else {
+                Style::default().fg(T.dim)
+            };
+            Line::from(vec![
+                Span::styled(format!("{:<4}", item.kind.tag()), dim),
+                Span::styled(fit(&item.text, name_w), row),
+                Span::styled(format!(" {}", fit(&item.detail, detail_w)), dim),
+            ])
+        })
+        .collect();
+    f.render_widget(Clear, rect);
+    f.render_widget(block, rect);
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn fit(s: &str, w: usize) -> String {
@@ -309,7 +402,10 @@ fn draw_grid(f: &mut Frame, area: Rect, app: &mut App) {
     let focused = app.focus() == Focus::Grid;
     let tab_idx = app.tab;
     let max_w = app.ui.max_column_width;
-    let title = grid_title(&app.tabs[tab_idx]);
+    let title = grid_title(
+        &app.tabs[tab_idx],
+        app.database_of(app.tabs[tab_idx].conn).unwrap_or_default(),
+    );
     let block = Block::bordered()
         .border_style(border(focused))
         .title(Span::styled(
@@ -449,8 +545,12 @@ fn draw_grid(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-fn grid_title(tab: &Tab) -> String {
-    let mut parts = vec![tab.conn_name.clone()];
+fn grid_title(tab: &Tab, database: &str) -> String {
+    let mut parts = vec![if database.is_empty() {
+        tab.conn_name.clone()
+    } else {
+        format!("{} · {database}", tab.conn_name)
+    }];
     match &tab.kind {
         TabKind::Data { schema, table } => parts.push(format!("{schema}.{table}")),
         TabKind::Structure { schema, table } => parts.push(format!("{schema}.{table} structure")),
@@ -505,8 +605,12 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
         ));
     }
     if let Some(tab) = app.active_tab() {
+        let target = match app.database_of(tab.conn) {
+            Some(db) => format!("{} · {db}", tab.conn_name),
+            None => tab.conn_name.clone(),
+        };
         left.push(Span::styled(
-            format!("{}  ", tab.conn_name),
+            format!("{target}  "),
             Style::default().fg(T.dim),
         ));
         if tab.view.cols() > 0 {
@@ -727,6 +831,56 @@ fn draw_confirm(f: &mut Frame, area: Rect, what: &Confirm) {
 }
 
 /// A centred box with an explicit height, for dialogs that size to content.
+fn draw_picker(f: &mut Frame, area: Rect, p: &Picker) {
+    let visible = p.visible();
+    let rows = visible.len().clamp(1, 12);
+    let rect = centered_lines(area, 50, rows as u16 + 4);
+    let block = Block::bordered()
+        .border_style(Style::default().fg(T.accent))
+        .title(Span::styled(
+            format!(" {} ", p.title),
+            Style::default().fg(T.accent),
+        ));
+    let inner = block.inner(rect);
+    f.render_widget(Clear, rect);
+    f.render_widget(block, rect);
+
+    let mut lines = vec![Line::from(vec![
+        Span::styled(" / ", Style::default().fg(T.dim)),
+        Span::raw(p.filter.clone()),
+        Span::styled("▏", Style::default().fg(T.accent)),
+    ])];
+    if p.loading {
+        lines.push(Line::styled(
+            format!(" {} listing databases…", SPINNER[0]),
+            Style::default().fg(T.dim),
+        ));
+    } else if visible.is_empty() {
+        lines.push(Line::styled(
+            "  no matching database",
+            Style::default().fg(T.dim),
+        ));
+    }
+    // Keep the selection in view in a window of `rows`.
+    let off = p.selected.saturating_sub(rows.saturating_sub(1));
+    for (i, name) in visible.iter().enumerate().skip(off).take(rows) {
+        let selected = i == p.selected;
+        lines.push(Line::styled(
+            format!(" {} {name}", if selected { "▸" } else { " " }),
+            if selected {
+                Style::default().bg(T.accent).fg(Color::Black)
+            } else {
+                Style::default()
+            },
+        ));
+    }
+    lines.push(Line::styled(
+        " type filters · enter switch · esc",
+        Style::default().fg(T.dim),
+    ));
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
 fn centered_lines(area: Rect, pct_x: u16, height: u16) -> Rect {
     let h = height.min(area.height);
     let top = area.height.saturating_sub(h) / 2;
@@ -848,7 +1002,102 @@ fn draw_form(f: &mut Frame, area: Rect, form: &Form) {
 
 #[cfg(test)]
 mod tests {
-    use super::fit;
+    use super::*;
+    use crate::config::Config;
+    use crate::keys::Action;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn screen(app: &mut App, width: u16, height: u16) -> String {
+        let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+        term.draw(|f| draw(f, app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                let row: String = (0..buf.area.width)
+                    .map(|x| buf.cell((x, y)).unwrap().symbol())
+                    .collect();
+                format!("{}\n", row.trim_end())
+            })
+            .collect()
+    }
+
+    fn app_with_a_query_tab() -> App {
+        let cfg = Config::parse(
+            r#"
+[[project]]
+name = "Alpha"
+  [[project.connection]]
+  name = "a-db"
+  engine = "postgres"
+  host = "h"
+  database = "d"
+  user = "u"
+"#,
+        )
+        .unwrap();
+        let mut app = App::new(cfg);
+        app.tree.set_schemas(0, vec!["public".into()]);
+        app.tree.set_tables(0, "public", vec!["users".into()]);
+        app.dispatch(Action::NewQueryTab);
+        app
+    }
+
+    #[test]
+    fn completion_popup_draws_below_the_cursor_and_over_the_grid() {
+        let mut app = app_with_a_query_tab();
+        app.tabs[0].editor.set_text("select * from us");
+        // Two frames: the first hands the renderer's anchor to the popup.
+        screen(&mut app, 80, 24);
+        app.dispatch(Action::Complete);
+        let out = screen(&mut app, 80, 24);
+        assert!(out.contains("tbl users"), "popup missing:\n{out}");
+        let popup_row = out.lines().position(|l| l.contains("tbl users")).unwrap();
+        let cursor_row = out
+            .lines()
+            .position(|l| l.contains("select * from us"))
+            .unwrap();
+        assert!(popup_row > cursor_row, "popup should hang below:\n{out}");
+    }
+
+    #[test]
+    fn the_database_picker_renders_over_the_panes() {
+        let mut app = app_with_a_query_tab();
+        app.on_db_event(crate::db::worker::DbEvent {
+            conn: 0,
+            payload: crate::db::worker::DbPayload::Databases(vec!["d".into(), "reporting".into()]),
+        });
+        // The databases also show up as a level in the tree.
+        let out = screen(&mut app, 80, 24);
+        assert!(
+            out.contains("◈ d"),
+            "tree missing the database level:\n{out}"
+        );
+        app.dispatch(Action::SwitchDatabase);
+        let out = screen(&mut app, 80, 24);
+        // The database the tab is already on starts selected.
+        assert!(out.contains("▸ d"), "picker missing:\n{out}");
+        assert!(out.contains("  reporting"), "picker missing:\n{out}");
+        assert!(out.contains("enter switch · esc"), "hint clipped:\n{out}");
+    }
+
+    #[test]
+    fn a_cursor_near_the_bottom_flips_the_popup_above_it() {
+        let mut app = app_with_a_query_tab();
+        app.fullscreen = true;
+        let mut text = "\n".repeat(30);
+        text.push_str("select * from us");
+        app.tabs[0].editor.set_text(&text);
+        screen(&mut app, 80, 24);
+        app.dispatch(Action::Complete);
+        let out = screen(&mut app, 80, 24);
+        let popup = out.lines().position(|l| l.contains("tbl users")).unwrap();
+        let cursor = out
+            .lines()
+            .position(|l| l.contains("select * from us"))
+            .unwrap();
+        assert!(popup < cursor, "popup should flip above:\n{out}");
+    }
 
     #[test]
     fn fit_pads_and_truncates() {

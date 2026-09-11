@@ -74,6 +74,17 @@ impl PgDriver {
 
 #[async_trait]
 impl Driver for PgDriver {
+    async fn databases(&mut self) -> Result<Vec<String>> {
+        self.strings(
+            "select datname from pg_database \
+             where datallowconn and not datistemplate \
+               and has_database_privilege(datname, 'CONNECT') \
+             order by 1",
+            &[],
+        )
+        .await
+    }
+
     async fn schemas(&mut self) -> Result<Vec<String>> {
         self.strings(
             "select nspname from pg_namespace \

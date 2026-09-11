@@ -224,6 +224,18 @@ impl Editor {
             .unwrap_or(self.lines[self.line].len())
     }
 
+    /// Replaces the chars in `[start, cursor)` on the current line, leaving
+    /// the cursor after the inserted text. Used to accept a completion.
+    pub fn replace_to_cursor(&mut self, start: usize, text: &str) {
+        self.snapshot();
+        let start = start.min(self.col);
+        let from = self.char_to_byte(start);
+        let to = self.char_to_byte(self.col);
+        self.lines[self.line].replace_range(from..to, text);
+        self.col = start + text.chars().count();
+        self.clamp();
+    }
+
     pub fn newline(&mut self) {
         self.snapshot();
         let byte = self.char_to_byte(self.col);

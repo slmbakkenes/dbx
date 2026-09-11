@@ -118,6 +118,12 @@ pub struct UiConfig {
     /// Confirm before running a statement that writes.
     #[serde(default = "d_true")]
     pub confirm_writes: bool,
+    /// Let the completion popup follow typing, without a chord.
+    #[serde(default = "d_true")]
+    pub auto_complete: bool,
+    /// How many characters of a word before the popup opens by itself.
+    #[serde(default = "d_complete_after")]
+    pub complete_after: usize,
 }
 
 fn d_page() -> usize {
@@ -129,6 +135,9 @@ fn d_colw() -> usize {
 fn d_true() -> bool {
     true
 }
+fn d_complete_after() -> usize {
+    1
+}
 
 impl Default for UiConfig {
     fn default() -> Self {
@@ -137,6 +146,8 @@ impl Default for UiConfig {
             max_column_width: d_colw(),
             mouse: false,
             confirm_writes: d_true(),
+            auto_complete: d_true(),
+            complete_after: d_complete_after(),
         }
     }
 }
@@ -171,6 +182,8 @@ pub const SAMPLE_CONFIG: &str = r#"# dbx configuration
 page_size = 500
 max_column_width = 48
 confirm_writes = true
+auto_complete = true     # completion popup follows typing
+complete_after = 1       # characters typed before it opens by itself
 
 [[project]]
 name = "Acme"
